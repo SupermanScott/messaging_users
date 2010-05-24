@@ -1,0 +1,640 @@
+<?php
+/**
+ * @file
+ * Messaging friends module
+ *
+ * Allows private messages between users, integrates with messaging, notifications and flags module
+ *
+ * @todo
+ * - See about message retention policy and when messages and logs should be deleted [Postponed]
+ *
+ **/
+ 
+// Message status: Unread
+define('MESSAGING_USERS_STATUS_UNREAD', 0);
+// Message status: Read
+define('MESSAGING_USERS_STATUS_READ', 1);
+// Message status: Deleted
+define('MESSAGING_USERS_STATUS_DELETE', 2);
+
+/**
+ * Load up a stored message
+ */
+function messaging_users_load($mqid) {
+  if (!is_numeric($mqid)) {
+    return FALSE;
+  }
+  $message  = messaging_message_load($mqid);
+  if (!$message->mqid || $message->method != 'users') {
+    return FALSE;
+  }
+  return $message;
+}
+
+/**
+ * Implementation of hook_menu()
+ */
+function messaging_users_menu() {
+  // User pages: Inbox, Outbox, Compose
+  $items['user/%user/messages'] = array(
+    'title' => 'Messages',
+    'title callback' => 'messaging_users_menu_title',
+    'title arguments' => array(1),
+    'page callback' => 'messaging_users_page',
+    'page arguments' => array(1, 'inbox'),
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('inbox', 1),
+    'file' => 'messaging_users.pages.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+  $items['user/%user/messages/inbox'] = array(
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'title' => 'Inbox',
+  );
+  $items['user/%user/messages/outbox'] = array(
+    'type' => MENU_LOCAL_TASK,
+    'title' => 'Outbox',
+    'page callback' => 'messaging_users_page',
+    'page arguments' => array(1, 'outbox'),
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('outbox', 1),
+    'file' => 'messaging_users.pages.inc',
+  );
+  $items['user/%user/messages/compose'] = array(
+    'type' => MENU_LOCAL_TASK,
+    'title' => 'New Message',
+    'page callback' => 'messaging_users_page_compose',
+    'page arguments' => array(1),
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('compose', 1),
+    'file' => 'messaging_users.pages.inc',
+    'weight' => -1,
+  );
+  $items['user/%user/messages/reply/%messaging_users'] = array(
+    'page callback' => 'messaging_users_reply',
+    'page arguments' => array(1, 4),
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('reply', 1),
+    'file' => 'messaging_users.pages.inc',
+  );
+  $items['user/%user/messages/delete/%messaging_users'] = array(
+    'page callback' => 'messaging_users_delete',
+    'page arguments' => array(1, 4),
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('compose', 1),
+    'file' => 'messaging_users.pages.inc',
+  );
+  $items['user/%user/messages/settings'] = array(
+    'type' => MENU_LOCAL_TASK,
+    'title' => 'Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('messaging_users_settings_form', 1),
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('settings', 1),
+    'file' => 'messaging_users.pages.inc',
+    'weight' => 10,
+  );
+  // Administration page
+  $items['admin/messaging/settings/users'] = array(
+    'title' => 'User messages',
+    'description' => 'Configuration for private user messages',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('messaging_users_admin_settings'),
+    'access arguments' => array('administer messaging'),
+    'file' => 'messaging_users.pages.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+  // Ajax callback
+  $items['messaging_users/js/autocomplete'] = array(
+    'description' => 'Autocomplete AJAX submission callback.',
+    'page callback' => 'messaging_users_autocomplete',
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('compose'),
+    'type' => MENU_CALLBACK,
+    'file' => 'messaging_users.pages.inc',
+  );
+  $items['messaging_users/js/destinations'] = array(
+    'description' => 'Autocomplete AJAX submission callback.',
+    'page callback' => 'messaging_users_destinations_list',
+    'access callback' => 'messaging_users_access',
+    'access arguments' => array('compose'),
+    'type' => MENU_CALLBACK,
+    'file' => 'messaging_users.pages.inc',
+  );
+  return $items;  
+}
+
+/**
+ * Menu title callback
+ */
+function messaging_users_menu_title($account) {
+  // Show the number of unread messages if any
+  $unread = _messaging_users_unread($account->uid);
+  return $unread ? t('Messages (@count)', array('@count' => $unread)) : t('Messages');
+}
+
+/**
+ * Menu access callback
+ */
+function messaging_users_access($op, $account = NULL, $message = NULL) {
+  global $user;
+  $account = $account ? $account : $user;
+  
+  switch ($op) {
+    case 'reply':
+      return user_access('administer messaging') || $account->uid == $user->uid;
+    case 'compose':
+      // @todo Remove this first one after testing
+      return  user_access('administer messaging') || $account->uid == $user->uid && (user_access('send messages to friends') || user_access('send messages to users'));
+    case 'read':
+      // Will be allowed if the user is sender or receiver
+      return $user->uid && (user_access('administer messaging') || $user->uid == $message->sender || messaging_users_message_receivers($message->mqid, $user->uid));
+    default:
+      return $user->uid && (user_access('administer messaging') || $user->uid == $account->uid);
+  }
+}
+
+/**
+ * Implementation of hook_perm()
+ */
+function messaging_users_perm() {
+  return array(
+    'send messages to friends',
+    'send messages to users',
+    'send messages to all users', // To 'All users' and roles 'Role [name]'
+    'get notifications for messages',
+  );
+}
+
+/**
+ * Implementation of hook_user().
+ */
+function messaging_users_user($type, &$edit, &$account) {
+  global $user;
+  
+  if ($type == 'view' && $user->uid != $account->uid && (_messaging_users_is_friend($user->uid, $account->uid) || _messaging_users_can_send($user))) {
+    $account->content['summary']['messaging'] =  array(
+      '#type' => 'user_profile_item',
+      '#title' => t('Private messages'),
+      '#value' => l(t('Send message'), "user/$user->uid/messages/compose/uid/$account->uid", array('attributes' => array('title' => t("Send a private message to @username's.", array('@username' => $account->name))))),
+      '#attributes' => array('class' => 'messaging'),
+    );
+  }
+  
+  if ($type == 'insert') {
+    $subs = array(
+      'sid' => 0,
+      'type' => 'messaging',
+      'event_type' => 'message',
+      'send_method' => notifications_user_setting('send_method', $account),
+      'send_interval' => 0,
+      'fields' => array('method' => 'users'),
+      'uid' => $account->uid,
+      'module' => 'messaging',
+      'status' => 0,
+    );
+
+    notifications_save_subscription($subs);
+    $message = variable_get('messaging_users_welcome', '');
+    if (!empty($message)) {
+      // send the message
+      $message_obj = new stdClass();
+      $message_obj->subject = t(variable_get('messaging_users_subject', ''));
+      $message_obj->body = $message;
+      $message_obj->sender_account = user_load(variable_get('messaging_users_welcome_sender', 18));
+      $destinations = array($account->uid);
+      messaging_message_send($destinations, $message_obj, 'users');
+    }
+  }
+  
+  if ($type == 'delete') {
+    module_load_include('inc', 'messaging_users', 'messaging_users.pages');
+    // find all inbox messages for this user
+    $sql = 'SELECT p.mqid FROM {messaging_users} p 
+      INNER JOIN {messaging_store} m ON m.mqid = p.mqid 
+      INNER JOIN {users} u ON p.sender = u.uid 
+      WHERE p.receiver = %d AND p.status <> %d';
+    $query = db_query($sql, $account->uid, MESSAGING_USERS_STATUS_DELETE);
+    $mqids = array();
+    while ($result = db_fetch_object($query)) {
+      $mqids[] = $result->mqid;
+      $count++;
+    }
+    if (!empty($mqids)) {
+      messaging_users_bulk_update('inbox', $account->uid, $mqids, MESSAGING_USERS_STATUS_DELETE);
+    }
+    
+    // find all outbox message for this user    
+    $sql = "SELECT m.mqid FROM {messaging_store} m 
+      WHERE m.sender = %d AND m.method = 'users'";
+    $query = db_query($sql, $account->uid);
+    $mqids = array();
+    while ($result = db_fetch_object($query)) {
+      $mqids[] = $result->mqid;
+      $count++;
+    }
+    if (!empty($mqids)) {
+      messaging_users_bulk_update('outbox', $account->uid, $mqids, MESSAGING_USERS_STATUS_DELETE);
+    }
+    if ($count) {
+      drupal_set_message(format_plural(count($count), 'A message has been deleted for user '. $account->uid .'.', '@count messages have been deleted for user '. $account->uid .'.'));
+    }
+  }
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function messaging_users_theme() {
+  return array(
+    'messaging_users_list' => array(
+      'arguments' => array('users' => NULL, 'title' => NULL),
+    ),
+    'messaging_users_reader_inbox' => array(
+      'arguments' => array('form' => NULL),
+      'file' => 'messaging_users.pages.inc',
+    ),
+    'messaging_users_reader_outbox' => array(
+      'arguments' => array('form' => NULL),
+      'file' => 'messaging_users.pages.inc',
+    ),
+    'messaging_users_destinations_subform' => array(
+      'arguments' => array('form' => NULL),
+      'file' => 'messaging_users.pages.inc',
+    ),
+    'messaging_users_destinations_table' => array(
+      'arguments' => array('destinations' => NULL, 'account' => NULL),
+      'file' => 'messaging_users.pages.inc',    
+    ),
+    'messaging_users_destinations_list' => array(
+      'arguments' => array('destinations' => NULL, 'account' => NULL),
+      'file' => 'messaging_users.pages.inc',    
+    ),
+    'messaging_users_message_preview' => array(
+      'arguments' => array('message' => NULL),
+      'file' => 'messaging_users.pages.inc',
+    ),
+    'messaging_users_page_read' => array(
+      'arguments' => array('form' => NULL),
+      'file' => 'messaging_users.pages.inc',
+    ),
+    'messaging_users_page_read_links' => array(
+      'arguments' => array('form' => NULL),
+      'file' => 'messaging_users.pages.inc',
+    ),
+    'messaging_users_picture' => array(
+      'arguments' => array('element' => array()),
+      'file' => 'messaging_users.pages.inc',
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_messaging()
+ */
+function messaging_users_messaging($op = 'info') {
+  switch($op) {
+    case 'send methods':
+      $info['users'] = array(
+        'title' => t('Private messages'),
+        'name' => t('Private message'),
+        'group' => 'web',
+        'type' => MESSAGING_TYPE_PUSH,
+        'glue' => '<br />',
+        'address_type' => 'user', // Field mapping for account destination
+        'description' => t('Send private messages and display them on a user account tab'),
+        'send callback' => 'messaging_users_send_msg', // Send to single destination
+        'multisend callback' => 'messaging_users_sendall_msg', // Send to multiple destinations
+        'render callback' => 'messaging_users_render', // because we don't render really unless we surface the message 
+      );
+      return $info;  
+  }
+}
+
+/**
+ * Renders full message with header and body
+ * 
+ * @param $message
+ *   Message object
+ * @param $info
+ *   Sending method info for rendering (glue and filter options)
+ */
+function messaging_users_render($message, $info) {
+  $message->rendered = TRUE;
+  return $message;
+}
+
+/**
+ * Implementation of hook_notifications()
+ * 
+ * Handle notifications to multiple receivers using the module's own table
+ */
+function messaging_users_notifications_event($op, $event) {
+  switch ($op) {
+    case 'query':
+      // If message->uid, the query will be produced by the messaging_notify module
+      if ($event->type == 'message') {
+        $query[] = array(
+          'fields' => array('method' => $event->objects['message']->method),
+          'join' => array('INNER JOIN {messaging_users} mu ON mu.mqid = ' . db_escape_string($event->objects['message']->mqid) . ' AND s.uid = mu.receiver'),
+        );
+
+        return $query;
+      }
+      break;    
+  }
+}
+
+/**
+ * Bulk sending callback
+ * 
+ * It stores the message and does the sending for each destination
+ */
+function messaging_users_sendall_msg($message, $info) {
+  // Prepare and store message
+  $message->queue = 0;
+  $message->cron = 0;
+  $message->sent = time();
+  $message = messaging_message_store($message);
+ 
+  foreach ($message->destinations as $to) {
+    messaging_users_send_msg($to, $message);
+  }
+
+  // Add a message count
+  $message->count = db_result(db_query("SELECT COUNT(*) FROM {messaging_users} WHERE mqid = %d", $message->mqid));
+  
+  // Bulk sending function need to return the message
+  return $message;
+}
+
+/**
+ * Message sending callback.
+ * 
+ * @param $destination
+ *   User id
+ */
+function messaging_users_send_msg($to, $message, $params = array()) {
+  // Check whether the message has been stored
+  if (empty($message->mqid)) {
+    $message->uid = $to;
+    $message->sent = time();
+    messaging_store()->message_save($message);
+  }
+  
+  // Fixed arguments, depending on destination we may get variable ones
+  $args = array($message->mqid, $message->sender, $message->sent);
+  
+  // Now we build the query depending on destination type
+  if (is_numeric($to)) {
+    // For each uid destination we store a row in the table
+    $select = 'VALUES(%d, %d, %d, %d, %d)'; 
+    $args[] = $to;
+    // If ignore user, mark message as deleted, so it is counted as sent, but never seen
+    $args[] = _messaging_users_accepts_from($message->sender_account, $to) ? MESSAGING_USERS_STATUS_UNREAD : MESSAGING_USERS_STATUS_DELETE;
+  }
+  elseif (_messaging_users_special_destinations('key', $to)) {
+    // For other destinations we build a full select with the users table
+    // The ignore flag doesn't apply to users with bulk sending permissions
+    $args[] = MESSAGING_USERS_STATUS_UNREAD;
+    if ($to == 'all users') {
+      $select = '(SELECT %d, %d, %d, u.uid, %d FROM {users} u WHERE u.status = 1)';
+    }
+    else {
+      list($type, $key) = explode(':', $to);
+      if ($type == 'role' && is_numeric($key)) {
+        $select = '(SELECT %d, %d, %d, u.uid, %d FROM {users} u INNER JOIN {users_roles} r ON r.uid = u.uid WHERE r.rid = %d AND u.status = 1)';
+        $args[] = (int)$key;
+      }
+    }
+  }
+
+  if (!empty($select)) {
+    return db_query('INSERT INTO {messaging_users}(mqid, sender, sent, receiver, status) ' . $select, $args);
+  } else {
+    return FALSE;
+  }
+
+}
+
+/**
+ * Get message destinations, or check whether a single user is receiver
+ */
+function messaging_users_message_receivers($mqid, $uid = NULL) {
+  $receivers = array();
+  $args[] = $mqid;
+  $sql = 'SELECT u.uid, u.name, m.status FROM {messaging_users} m INNER JOIN {users} u ON m.receiver = u.uid WHERE mqid = %d';
+  if ($uid) {
+    $sql .= ' AND receiver = %d';
+    $args[] = $uid;
+  }
+  $result = db_query($sql, $args);
+  while ($rec = db_fetch_object($result)) {
+    $receivers[$rec->uid] = $rec;
+  }
+  return $receivers;
+}
+
+/**
+ * Implementation of hook_email_verify().
+ */
+function messaging_users_email_verify($account, $verfied) {
+  $existing = current(notifications_get_subscriptions(array('uid' => $account->uid, 'type' => 'messaging'), array('method' => 'users')));
+  $existing->status = $verfied;
+  notifications_save_subscription($existing);
+}
+
+/**
+ * List of special destinations
+ */
+function _messaging_users_special_destinations($type = 'all', $key = NULL) {
+  static $list;
+  
+  if (!isset($list)) {  
+    $list['all users'] = t('All users');
+    foreach (user_roles() as $rid => $name) {
+      if (!in_array($rid, array(DRUPAL_ANONYMOUS_RID, DRUPAL_AUTHENTICATED_RID))) {
+        $list['role:' . $rid] = t('Role !role', array('!role' => $name) );
+      }
+    }
+  }
+  switch ($type) {
+    case 'all':
+      return $list;
+    case 'key':
+      return isset($list[$key]) ? $list[$key] : NULL;
+    case 'name':
+      if ($found = array_search($key, $list)) {
+        return $found;
+      } else {
+        return NULL;
+      }
+  }
+}
+
+/**
+ * Check user's spam quota (messages to non friends)
+ * 
+ * @param $account
+ *   User account that will be sending
+ * @return integer
+ *   Number of messages still to be sent. -1 means 'unlimited'
+ */
+ function _messaging_users_can_send($account) {
+   if (user_access('send messages to all users', $account)) {
+     $left = -1;
+   } elseif (!user_access('send messages to users', $account)) {
+     $left = 0;
+   } elseif ($quota = _messaging_users_spam_quota($account)) {
+     // Count the number of messages to non friends in the latest 24h
+     $count = _messaging_users_send_count($account->uid);
+     $left = $quota > $count ? $quota - $count : 0;
+   } else {
+     // No limits set up, return 'unlimited'
+     $left = -1;
+   }
+   return $left;
+}
+
+/**
+ * Check whether the receiver accepts messages from this sender
+ */
+function _messaging_users_accepts_from($sender, $uid) {
+  static $cache;
+  
+  if (!isset($cache[$sender->uid][$uid])) {
+    if ($flag = _messaging_users_flag_get('ignore')) {
+      // Retrieve all flags for this sender
+      // @todo look for a good way using Flag API
+      if (!isset($cache[$sender->uid])) {
+        $ignore = array();
+        $result = db_query("SELECT uid FROM {flag_content} WHERE fid = %d AND content_id = %d", $flag->fid, $sender->uid);
+        while ($flagged = db_fetch_object($result)) {
+          $ignore[$flagged->uid] = FALSE;
+        }
+        $cache[$sender->uid] = $ignore;
+        $accept = !array_key_exists($uid, $ignore);
+      } else {
+        // We already have the flags, but this uid is not here
+        $accept = TRUE;
+      }
+    } else {
+      $accept = TRUE;
+    }
+    $cache[$sender->uid][$uid] = $accept;
+  }
+  
+  return $cache[$sender->uid][$uid];
+}
+
+/**
+ * Flag integration, get a given flag object
+ */
+function _messaging_users_flag_get($type) {
+  if (!module_exists('flag')) {
+    return FALSE;
+  }
+
+  switch ($type) {
+    case 'ignore':
+      if (($fid = variable_get('messaging_users_ignore_flag', '')) && ($flag = flag_get_flag(NULL, $fid))) {
+        return $flag;
+      }
+      break;
+  }
+     
+  
+}
+
+/**
+ * Get the spam quota for a given user account
+ * 
+ * @return integer
+ *   Spam quota, 0 means no limit
+ */
+function _messaging_users_spam_quota($account) {
+  static $cache;
+
+  if (!isset($cache[$account->uid])) {
+    $max = 0;
+    $limits = variable_get('messaging_users_spam_role', array());
+    foreach (array_keys($account->roles) as $rid) {
+      // If one of the roles has no limit (0), the user will get it
+      if (!empty($limits[$rid])) {
+        $max = max($max, $limits[$rid]);
+      } else {
+        $max = 0;
+        break;
+      }
+    }
+    $cache[$account->uid] = $max;
+  }
+
+  return $cache[$account->uid];;
+}
+
+/**
+ * Get number of sent messages to non friends
+ */
+function _messaging_users_send_count($uid) {
+   $exclude = NULL;
+   if (module_exists('flag_friend')) {
+     // Do not count messages to friends
+     if ($friends = flag_friend_get_friends($uid)) {
+       $exclude = array_keys($friends);
+     }
+   } 
+   $sql = "SELECT COUNT(*) FROM {messaging_users} WHERE sender = %d AND sent > %d";
+   $args = array($uid, time() - 60 * 60);
+   if ($exclude) {
+     $sql .= " AND receiver NOT IN (" . db_placeholders($exclude, 'int') . ')';
+     $args = array_merge($args, $exclude);
+   }
+   return db_result(db_query($sql, $args));
+}
+
+/**
+ * Get friend list uids.
+ * 
+ * For now it works with flag_friend module, it may work with more in the future
+ */
+function _messaging_users_get_friends($uid) {
+  static $cache;
+  if (!isset($cache[$uid])) {
+    if (module_exists('flag_friend') && ($friends = flag_friend_get_friends($uid))) {
+      $cache[$uid] = array_keys($friends);
+    } else {
+      $cache[$uid] = array();
+    }
+  }
+  
+  return $cache[$uid];
+}
+
+/**
+ * Check whether users are friends
+ */
+function _messaging_users_is_friend($uid, $friend_uid) {
+  return in_array($friend_uid, _messaging_users_get_friends($uid));
+}
+
+/**
+ * Get the number of unread messages on inbox
+ */
+function _messaging_users_unread($uid) {
+  static $cache;  
+  if (!isset($cache[$uid])) {
+    $cache[$uid] = db_result(db_query("SELECT COUNT(*) FROM {messaging_users} WHERE receiver = %d AND status = %d", $uid, MESSAGING_USERS_STATUS_UNREAD));;
+  }
+  return $cache[$uid];
+}
+
+/**
+ * Implementation of hook_flag_default_flags().
+ */
+function messaging_users_flag_default_flags() {
+  $flags = array();
+  module_load_include('inc', 'messaging_users', 'messaging_users.flag_default');
+  _messaging_users_block_user_pm_flags($flags);
+  return $flags;
+}

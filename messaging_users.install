@@ -1,0 +1,109 @@
+<?php
+/**
+ * Implementation of hook_install().
+ */
+function messaging_users_install() {
+  // Create tables.
+  drupal_install_schema('messaging_users');
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function messaging_users_uninstall() {
+  // Remove tables.
+  drupal_uninstall_schema('messaging_users');
+}
+
+/**
+ * Implementation of hook_schema().
+ */
+function messaging_users_schema() {
+  $schema['messaging_users'] = array(
+    'description' => 'Inbox, outbox indexes for private messages',
+    'fields' => array(
+      'mqid'    => array(
+        'type' => 'int',
+        'unsigned' => TRUE, 
+        'not null' => TRUE,
+        'description' => 'Message index for the messaging store'
+      ),
+      'receiver'    => array(
+        'type' => 'int',
+        'unsigned' => TRUE, 
+        'not null' => TRUE, 
+        'default' => 0,
+        'description' => 'User id, message receiver',
+      ),
+      'sender'    => array(
+        'type' => 'int',
+        'unsigned' => TRUE, 
+        'not null' => TRUE, 
+        'default' => 0,
+        'description' => 'User id, message sender',
+      ),
+      'status' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+        'size' => 'tiny',
+        'description' => 'The status of this message for this user (0 = Unread, 1 = Read, 2 = Deleted)',
+      ),
+      'type' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+        'size' => 'tiny',
+        'description' => 'The type of message (0 = Friend, 1 = Non friend, 2 = Self (outbox))',
+      ),
+      'sent' => array(
+        'type' => 'int', 
+        'not null' => TRUE, 
+        'default' => 0,
+        'description' => 'Timestamp for message sent, will speed up queries'), 
+    ),
+    'primary key' => array('mqid', 'sender', 'receiver'),
+  );
+  return $schema;
+}
+
+/**
+* update hook to add in a subscription to all private messages
+*/
+function messaging_users_update_6001() {
+  $limit = 250; // 50 users at a time
+  $ret = array();
+  if (!isset($_SESSION['messaging_users_6001'])) {
+    db_query("DELETE FROM {notifications} WHERE type = 'messaging'");
+    db_query("DELETE FROM {notifications_fields} WHERE field = 'method'");
+    $_SESSION['messaging_users_6001'] = array(
+      'uid' => 0,
+      'max' => db_result(db_query('SELECT MAX(uid) FROM {users}')),
+    );
+  }
+  $result = db_query_range("SELECT uid FROM {users} WHERE uid > %d", $_SESSION['messaging_users_6001']['uid'], 0, $limit);
+  $count = 0;
+  while ($uid_object = db_fetch_object($result)) {
+    $account = user_load($uid_object->uid);
+    $subs = array(
+      'sid' => 0,
+      'type' => 'messaging',
+      'event_type' => 'message',
+      'send_method' => notifications_user_setting('send_method', $account),
+      'send_interval' => notifications_user_setting('send_interval', $account),
+      'fields' => array('method' => 'users'),
+      'uid' => $account->uid,
+      'module' => 'messaging',
+    );
+    notifications_save_subscription($subs);
+    $_SESSION['messaging_users_6001']['uid'] = $account->uid;
+    $count++;
+  }
+  if ($count == $limit) {
+    return array('#finished' => $_SESSION['messaging_users_6001']['uid'] / ($_SESSION['messaging_users_6001']['max'] + 1));
+  }
+  unset($_SESSION['messaging_users_6001']);
+  return $ret;
+}
